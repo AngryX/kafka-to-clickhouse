@@ -24,7 +24,7 @@ class KafkaWorker<K, V>(
     private val paused = AtomicBoolean(false)
     private val partitionsList = PartitionsList()
 
-    val commitCallback = OffsetCommitCallback { offsets, e ->
+    private val commitCallback = OffsetCommitCallback { offsets, e ->
         if(e != null){
             //todo: add metric
             log.error("Error while committing offsets {}", offsets, e)
@@ -40,6 +40,7 @@ class KafkaWorker<K, V>(
 
     override fun close() {
         closed.set(true)
+        consumer.wakeup()
     }
 
     override fun run() {
