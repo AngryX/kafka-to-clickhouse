@@ -1,15 +1,12 @@
 package com.github.kafka.clickhouse
 
-import org.apache.kafka.clients.consumer.ConsumerRebalanceListener
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.consumer.OffsetCommitCallback
+import org.apache.kafka.clients.consumer.*
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.WakeupException
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-//todo: reset offset in case of exception
 class KafkaWorker<K, V>(
         private val consumer: KafkaConsumer<K, V>,
         private val processor: RecordsProcessor<V>,
@@ -39,32 +36,26 @@ class KafkaWorker<K, V>(
     }
 
     override fun close() {
-        closed.set(true)
         consumer.wakeup()
     }
 
     override fun run() {
         log.info("KafkaWorker is run")
         try{
-            while(closed.get()){
+            while(true){
                 val ready = processor.isReady()
-                if(ready && paused.compareAndSet(false, true)){
+                if(ready && paused.compareAndSet(true, false)){
                     consumer.resume(consumer.paused())
                 }
-                //todo: add latency metric
-                //todo: add batch size metric
-                val records = consumer.poll(options.pollTimeout)
 
-                processor.handle(records.map { it.value() })
+                pollAndHandle()
 
                 if(ready){
                     consumer.commitAsync(commitCallback)
-                } else {
+                } else if(paused.compareAndSet(false, true)) {
                     //todo: add counter
                     log.info("KafkaWorker is getting sleep for a while")
-                    if(paused.compareAndSet(true, false)){
-                        consumer.pause(partitionsList.get())
-                    }
+                    consumer.pause(consumer.assignment())
                 }
             }
         } catch(e: WakeupException){
@@ -74,8 +65,32 @@ class KafkaWorker<K, V>(
         } finally {
             commitBeforeClosing()
             consumer.close()
+            closed.set(true)
             log.info("KafkaWorker is closed")
         }
+    }
+
+    private fun pollAndHandle(){
+        //todo: add latency metric
+        //todo: add batch size metric
+        val records = consumer.poll(options.pollTimeout)
+        try{
+            processor.handle(records.map { it.value() })
+        } catch(e: Exception){
+            //todo: error metric
+            log.error("Error while handling data", e)
+            seekToCurrent(records)
+
+        }
+
+
+    }
+
+    private fun seekToCurrent(records: ConsumerRecords<K, V>) {
+        records.groupBy({ r -> TopicPartition(r.topic(), r.partition()) }) { r ->
+            r.offset()
+        }.mapValues { it.value.min() ?: 0 }
+                .forEach { partition, offset -> consumer.seek(partition, offset) }
     }
 
     private fun commitBeforeClosing()  = try {
@@ -96,20 +111,11 @@ class PartitionsList: ConsumerRebalanceListener {
 
     override fun onPartitionsAssigned(partitions: Collection<TopicPartition>) {
         log.info("Partitions to assign: {}", partitions.map { it.toString() })
-        var current = this.partitions.get()
-        while (!this.partitions.compareAndSet(current, current.plus(partitions))){
-            current = this.partitions.get()
-        }
-        log.info("Partitions assigned: {}", this.partitions.get().map { it.toString() })
+        this.partitions.set(partitions.toSet())
     }
 
     override fun onPartitionsRevoked(partitions: Collection<TopicPartition>) {
         log.info("Partitions to revoke: {}", partitions.map { it.toString() })
-        var current = this.partitions.get()
-        while (!this.partitions.compareAndSet(current, current.minus(partitions))){
-            current = this.partitions.get()
-        }
-        log.info("Partitions assigned: {}", this.partitions.get().map { it.toString() })
-
+        this.partitions.set(emptySet())
     }
 }
